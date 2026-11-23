@@ -56,6 +56,7 @@ class PaymentTrigger(StrEnum):
     retry_payment_method_update = "retry_payment_method_update"
     retry_admin = "retry_admin"
     retry_payment_alert = "retry_payment_alert"
+    trial_reactivation = "trial_reactivation"
 
     def is_renewal_payment(self) -> bool:
         """Whether this trigger drives a recurring-billing payment (cycle +
@@ -83,6 +84,7 @@ DUNNING_NON_COUNTING_TRIGGERS: set[PaymentTrigger] = {
     PaymentTrigger.retry_payment_method_update,
     PaymentTrigger.retry_admin,
     PaymentTrigger.retry_payment_alert,
+    PaymentTrigger.trial_reactivation,
 }
 
 

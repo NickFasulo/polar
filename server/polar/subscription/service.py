@@ -97,6 +97,7 @@ from polar.models import (
     Order,
     OrderItem,
     Organization,
+    Payment,
     PaymentMethod,
     Product,
     ProductBenefit,
@@ -142,7 +143,11 @@ from polar.product.service import product as product_service
 from polar.redis import Redis
 from polar.trial_redemption.service import trial_redemption as trial_redemption_service
 from polar.webhook.service import webhook as webhook_service
-from polar.worker import enqueue_job, make_bulk_job_delay_calculator
+from polar.worker import (
+    JobQueueManager,
+    enqueue_job,
+    make_bulk_job_delay_calculator,
+)
 
 from .repository import SubscriptionRepository, SubscriptionUpdateRepository
 from .schemas import (
@@ -155,6 +160,7 @@ from .schemas import (
     SubscriptionCreateCustomer,
     SubscriptionMeterChargePreview,
     SubscriptionPause,
+    SubscriptionReactivationPreview,
     SubscriptionResume,
     SubscriptionRevoke,
     SubscriptionUpdate,
@@ -513,6 +519,11 @@ def _from_timestamp(t: int | None) -> datetime | None:
     if t is None:
         return None
     return datetime.fromtimestamp(t, UTC)
+
+
+class _ReactivationPreviewBuilt(Exception):
+    def __init__(self, preview: SubscriptionReactivationPreview) -> None:
+        self.preview = preview
 
 
 class SubscriptionUpdateContext:
@@ -3223,39 +3234,101 @@ class SubscriptionService:
         session: AsyncSession,
         ctx: SubscriptionUpdateContext,
         subscription: Subscription,
+        *,
+        payment: Payment | None = None,
     ) -> Subscription:
-        """Start a paid period for a trial_ended subscription and charge it now.
+        """Start a paid period for a trial_ended subscription.
 
-        The charge runs synchronously: if it fails, PaymentFailed propagates and
-        the caller's transaction rolls back, leaving the subscription trial_ended.
+        Without a payment, the order is charged synchronously off-session: if it
+        fails, PaymentFailed propagates and the caller's transaction rolls back,
+        leaving the subscription trial_ended. With a payment that already
+        succeeded on-session, the order is marked as paid by it.
         """
-        if subscription.status != SubscriptionStatus.trial_ended:
-            raise NotTrialEndedSubscription(subscription)
-
-        if not subscription.organization.can_renew_subscriptions:
-            raise PaymentNotReady("Organization is not ready to renew subscriptions")
-
-        if not self._has_payment_method(
-            subscription
-        ) or not self._has_complete_billing_address(subscription):
+        self._check_trial_reactivable(subscription)
+        if not self._has_payment_method(subscription):
             raise MissingBillingDetails(subscription)
 
         now = utc_now()
-        subscription.status = SubscriptionStatus.active
-        subscription.ends_at = None
-        subscription = await self._start_fresh_period(session, ctx, subscription, now)
-        await billing_interval_service.record_subscription(
-            session, subscription, effective_at=now
-        )
+        subscription = await self._activate_ended_trial(session, ctx, subscription, now)
 
         await self._create_subscription_update_order(
             session,
             subscription,
             OrderBillingReasonInternal.subscription_cycle_after_trial,
             cutoff=now,
+            payment=payment,
         )
 
         log.info("subscription.trial_ended.reactivated", id=subscription.id)
+        return subscription
+
+    async def preview_trial_reactivation(
+        self, session: AsyncSession, subscription: Subscription
+    ) -> SubscriptionReactivationPreview:
+        """Price the order a reactivation would create now, without persisting it.
+
+        The reactivation runs in a savepoint that is rolled back, and the jobs it
+        enqueues are discarded. The rollback expires the session's objects: reload
+        them before reading them again.
+        """
+        self._check_trial_reactivable(subscription)
+
+        nested = await session.begin_nested()
+        try:
+            with JobQueueManager.get().discard():
+                ctx = SubscriptionUpdateContext(
+                    session, subscription, self, notify_customer=False
+                )
+                now = utc_now()
+                subscription = await self._activate_ended_trial(
+                    session, ctx, subscription, now
+                )
+                async with billing_entry_service.create_order_items_from_pending(
+                    session, subscription, include_metered=True, cutoff=now
+                ) as items:
+                    order = await self._build_preview_order(
+                        session,
+                        subscription,
+                        list(items),
+                        billing_reason=(
+                            OrderBillingReasonInternal.subscription_cycle_after_trial
+                        ),
+                        discount=subscription.discount,
+                    )
+                    # Leave by raising, so the billing entries aren't linked to
+                    # order items that are never persisted.
+                    raise _ReactivationPreviewBuilt(
+                        SubscriptionReactivationPreview.from_order(order)
+                    )
+        except _ReactivationPreviewBuilt as built:
+            return built.preview
+        finally:
+            await nested.rollback()
+        raise AssertionError("The reactivation preview wasn't built")
+
+    def _check_trial_reactivable(self, subscription: Subscription) -> None:
+        if subscription.status != SubscriptionStatus.trial_ended:
+            raise NotTrialEndedSubscription(subscription)
+
+        if not subscription.organization.can_renew_subscriptions:
+            raise PaymentNotReady("Organization is not ready to renew subscriptions")
+
+        if not self._has_complete_billing_address(subscription):
+            raise MissingBillingDetails(subscription)
+
+    async def _activate_ended_trial(
+        self,
+        session: AsyncSession,
+        ctx: SubscriptionUpdateContext,
+        subscription: Subscription,
+        now: datetime,
+    ) -> Subscription:
+        subscription.status = SubscriptionStatus.active
+        subscription.ends_at = None
+        subscription = await self._start_fresh_period(session, ctx, subscription, now)
+        await billing_interval_service.record_subscription(
+            session, subscription, effective_at=now
+        )
         return subscription
 
     async def _start_fresh_period(
@@ -5201,6 +5274,7 @@ class SubscriptionService:
         *,
         cutoff: datetime | None = None,
         period_start: datetime | None = None,
+        payment: Payment | None = None,
     ) -> Order:
         from polar.order.service import order as order_service
 
@@ -5211,6 +5285,7 @@ class SubscriptionService:
             cutoff=cutoff,
             period_start=period_start,
             payment_mode=PaymentMode.sync,
+            payment=payment,
         )
 
 

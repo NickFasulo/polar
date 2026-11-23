@@ -1188,6 +1188,46 @@ export interface paths {
     patch?: never
     trace?: never
   }
+  '/v1/customer-portal/subscriptions/{id}/reactivation-preview': {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    /**
+     * Preview Reactivation Charge
+     * @description Get the charge that reactivates a trial_ended subscription.
+     */
+    get: operations['customer_portal:subscriptions:get_reactivation_preview']
+    put?: never
+    post?: never
+    delete?: never
+    options?: never
+    head?: never
+    patch?: never
+    trace?: never
+  }
+  '/v1/customer-portal/subscriptions/{id}/reactivate': {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    get?: never
+    put?: never
+    /**
+     * Reactivate Subscription
+     * @description Pay to reactivate a trial_ended subscription.
+     */
+    post: operations['customer_portal:subscriptions:reactivate']
+    delete?: never
+    options?: never
+    head?: never
+    patch?: never
+    trace?: never
+  }
   '/v1/customer-portal/subscriptions/{id}/meter-charge-preview': {
     parameters: {
       query?: never
@@ -29829,6 +29869,17 @@ export interface components {
       /** Detail */
       detail: string
     }
+    /** NotReactivable */
+    NotReactivable: {
+      /**
+       * Error
+       * @example NotReactivable
+       * @constant
+       */
+      error: 'NotReactivable'
+      /** Detail */
+      detail: string
+    }
     /** NotTrialEndedSubscription */
     NotTrialEndedSubscription: {
       /**
@@ -35086,6 +35137,7 @@ export interface components {
       | 'retry_payment_method_update'
       | 'retry_admin'
       | 'retry_payment_alert'
+      | 'trial_reactivation'
     /** Payout */
     Payout: {
       /**
@@ -37347,6 +37399,17 @@ export interface components {
       totals?: {
         [key: string]: string
       }
+    }
+    /** ReactivationInProgress */
+    ReactivationInProgress: {
+      /**
+       * Error
+       * @example ReactivationInProgress
+       * @constant
+       */
+      error: 'ReactivationInProgress'
+      /** Detail */
+      detail: string
     }
     /** RecordNotSubscription */
     RecordNotSubscription: {
@@ -40455,6 +40518,52 @@ export interface components {
       recurring_interval?: string
       /** Recurring Interval Count */
       recurring_interval_count?: number
+    }
+    /**
+     * SubscriptionReactivationPreview
+     * @description Preview of the charge that reactivates a subscription.
+     */
+    SubscriptionReactivationPreview: {
+      /**
+       * Currency
+       * @description Currency of the charge.
+       */
+      currency: string
+      /**
+       * Subtotal Amount
+       * @description Subtotal amount in cents, before discount and tax.
+       */
+      subtotal_amount: number
+      /**
+       * Discount Amount
+       * @description Discount amount in cents.
+       */
+      discount_amount: number
+      /**
+       * Net Amount
+       * @description Net amount in cents before taxes.
+       */
+      net_amount: number
+      /**
+       * Tax Amount
+       * @description Tax amount in cents.
+       */
+      tax_amount: number
+      /**
+       * Total Amount
+       * @description Total amount in cents (net + tax, before applying wallet balance).
+       */
+      total_amount: number
+      /**
+       * Applied Balance Amount
+       * @description Wallet balance applied to this charge in cents: negative when the customer's account credit reduces the amount due, positive when the charge clears outstanding debt, zero otherwise.
+       */
+      applied_balance_amount: number
+      /**
+       * Due Amount
+       * @description Amount charged to reactivate the subscription, in cents.
+       */
+      due_amount: number
     }
     /**
      * SubscriptionReinstatedEvent
@@ -50071,6 +50180,115 @@ export interface operations {
         }
         content: {
           'application/json': components['schemas']['ResourceNotFound']
+        }
+      }
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['HTTPValidationError']
+        }
+      }
+    }
+  }
+  'customer_portal:subscriptions:get_reactivation_preview': {
+    parameters: {
+      query?: never
+      header?: never
+      path: {
+        /** @description The subscription ID. */
+        id: string
+      }
+      cookie?: never
+    }
+    requestBody?: never
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['SubscriptionReactivationPreview']
+        }
+      }
+      /** @description Customer subscription was not found. */
+      404: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['ResourceNotFound']
+        }
+      }
+      /** @description Subscription can't be reactivated, or the customer is missing a complete billing address. */
+      409: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json':
+            | components['schemas']['NotReactivable']
+            | components['schemas']['MissingBillingDetails']
+        }
+      }
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['HTTPValidationError']
+        }
+      }
+    }
+  }
+  'customer_portal:subscriptions:reactivate': {
+    parameters: {
+      query?: never
+      header?: never
+      path: {
+        /** @description The subscription ID. */
+        id: string
+      }
+      cookie?: never
+    }
+    requestBody: {
+      content: {
+        'application/json': components['schemas']['CustomerOrderConfirmPayment']
+      }
+    }
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['CustomerOrderPaymentConfirmation']
+        }
+      }
+      /** @description Customer subscription was not found. */
+      404: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['ResourceNotFound']
+        }
+      }
+      /** @description Subscription can't be reactivated, the customer is missing a complete billing address, or a reactivation payment is already in progress. */
+      409: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json':
+            | components['schemas']['NotReactivable']
+            | components['schemas']['MissingBillingDetails']
+            | components['schemas']['ReactivationInProgress']
         }
       }
       /** @description Validation Error */
@@ -77222,6 +77440,7 @@ export const paymentTriggerValues: ReadonlyArray<
   'retry_payment_method_update',
   'retry_admin',
   'retry_payment_alert',
+  'trial_reactivation',
 ]
 export const payoutAccountStatusValues: ReadonlyArray<
   FlattenedDeepRequired<components>['schemas']['PayoutAccountStatus']

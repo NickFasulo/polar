@@ -7,11 +7,14 @@ from opentelemetry import trace
 from sqlalchemy.orm import joinedload, selectinload
 
 from polar.exceptions import PolarTaskError
+from polar.integrations.stripe.service import stripe as stripe_service
 from polar.kit.utils import utc_now
 from polar.logging import Logger
 from polar.models import Subscription, SubscriptionMeter
 from polar.models.subscription import SubscriptionStatus
 from polar.observability.task_logging import LoggableField
+from polar.payment.repository import PaymentRepository
+from polar.payment_method.service import payment_method as payment_method_service
 from polar.product.repository import ProductRepository
 from polar.subscription.repository import SubscriptionRepository
 from polar.worker import (
@@ -37,6 +40,13 @@ class SubscriptionDoesNotExist(SubscriptionTaskError):
     def __init__(self, subscription_id: uuid.UUID) -> None:
         self.subscription_id = subscription_id
         message = f"The subscription with id {subscription_id} does not exist."
+        super().__init__(message)
+
+
+class PaymentDoesNotExist(SubscriptionTaskError):
+    def __init__(self, payment_id: uuid.UUID) -> None:
+        self.payment_id = payment_id
+        message = f"The payment with id {payment_id} does not exist."
         super().__init__(message)
 
 
@@ -397,6 +407,61 @@ async def cancel_expired_trial_ended(
         ) as ctx:
             await subscription_service.revoke(session, ctx, subscription)
         await repository.release_scheduler_lock(subscription)
+
+
+@actor(
+    actor_name="subscription.reactivate_ended_trial",
+    priority=TaskPriority.HIGH,
+)
+async def reactivate_ended_trial(
+    subscription_id: Annotated[uuid.UUID, LoggableField],
+    payment_id: Annotated[uuid.UUID, LoggableField],
+) -> None:
+    """Apply an on-session payment that reactivates a trial_ended subscription.
+
+    Enqueued by the charge.succeeded webhook. If the subscription can't be
+    reactivated anymore, this raises: the payment has to be refunded manually.
+    """
+    async with AsyncSessionMaker() as session:
+        repository = SubscriptionRepository.from_session(session)
+        subscription = await repository.get_by_id(
+            subscription_id,
+            options=repository.get_eager_options(),
+            for_update=True,
+        )
+        if subscription is None:
+            raise SubscriptionDoesNotExist(subscription_id)
+
+        payment = await PaymentRepository.from_session(session).get_by_id(payment_id)
+        if payment is None:
+            raise PaymentDoesNotExist(payment_id)
+
+        if payment.order_id is not None:
+            log.info(
+                "Trial reactivation payment already applied",
+                subscription_id=subscription_id,
+                payment_id=payment_id,
+            )
+            return
+
+        charge = await stripe_service.get_charge(payment.processor_id)
+        stripe_payment_method = await payment_method_service.resolve_from_stripe_intent(
+            charge
+        )
+        payment_method = await payment_method_service.upsert_from_stripe(
+            session, subscription.customer, stripe_payment_method, flush=True
+        )
+        subscription = await subscription_service.update_payment_method_from_retry(
+            session, subscription, payment_method
+        )
+        await session.flush()
+
+        async with SubscriptionUpdateContext(
+            session, subscription, subscription_service
+        ) as ctx:
+            await subscription_service.reactivate_ended_trial(
+                session, ctx, subscription, payment=payment
+            )
 
 
 @actor(actor_name="subscription.bulk_update", priority=TaskPriority.LOW)

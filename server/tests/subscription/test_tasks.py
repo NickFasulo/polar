@@ -1,12 +1,17 @@
 import uuid
 from datetime import timedelta
-from unittest.mock import ANY
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 from freezegun.api import freeze_time
 from pytest_mock import MockerFixture
 
-from polar.enums import SubscriptionProrationBehavior, SubscriptionRecurringInterval
+from polar.enums import (
+    SubscriptionProrationBehavior,
+    SubscriptionRecurringInterval,
+    TaxBehavior,
+    TaxProcessor,
+)
 from polar.event.repository import EventRepository
 from polar.kit.address import Address, CountryAlpha2
 from polar.kit.utils import utc_now
@@ -14,22 +19,26 @@ from polar.models import (
     Customer,
     Meter,
     Organization,
+    Payment,
     PaymentMethod,
     Product,
     Subscription,
 )
 from polar.models.discount import DiscountDuration, DiscountType
-from polar.models.order import OrderBillingReasonInternal
+from polar.models.order import OrderBillingReasonInternal, OrderStatus
 from polar.models.organization import OrganizationStatus
+from polar.models.payment import PaymentTrigger
 from polar.models.subscription import SubscriptionStatus
 from polar.models.webhook_endpoint import WebhookEventType
 from polar.order.repository import OrderRepository
 from polar.postgres import AsyncSession
+from polar.product.guard import is_fixed_price
 from polar.subscription.service import SubscriptionMeterCycleLag, SubscriptionService
 from polar.subscription.tasks import (  # type: ignore[attr-defined]
     SubscriptionDoesNotExist,
     SubscriptionTierDoesNotExist,
     cancel_expired_trial_ended,
+    reactivate_ended_trial,
     scan_grace_expired_revocations,
     subscription_cancel_for_organization,
     subscription_cycle,
@@ -45,9 +54,11 @@ from tests.fixtures.random_objects import (
     create_benefit,
     create_benefit_grant,
     create_discount,
+    create_payment,
     create_subscription,
     create_trialing_subscription,
 )
+from tests.fixtures.stripe import build_stripe_payment_method
 
 
 @pytest.mark.anyio
@@ -814,3 +825,76 @@ class TestCancelExpiredTrialEnded:
         assert updated_subscription.status == status
         assert updated_subscription.ended_at is None
         assert updated_subscription.scheduler_locked_at is None
+
+
+@pytest.mark.anyio
+class TestReactivateEndedTrial:
+    async def test_applies_payment(
+        self,
+        mocker: MockerFixture,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        product: Product,
+        customer: Customer,
+    ) -> None:
+        mocker.patch("polar.subscription.service.enqueue_job")
+        mocker.patch("polar.subscription.service.webhook_service.send")
+        tax_mock = mocker.patch("polar.order.amounts.tax_calculation_service")
+        mocker.patch("polar.order.service.tax_calculation_service", new=tax_mock)
+        tax_mock.calculate = AsyncMock(
+            return_value=(
+                {
+                    "processor_id": "TAX_PROCESSOR_ID",
+                    "amount": 0,
+                    "currency": "usd",
+                    "tax_behavior": TaxBehavior.exclusive,
+                    "tax_breakdown": [],
+                },
+                TaxProcessor.stripe,
+            )
+        )
+        tax_mock.record = AsyncMock(
+            return_value=("TAX_TRANSACTION_ID", TaxProcessor.stripe)
+        )
+        mocker.patch(
+            "polar.subscription.tasks.stripe_service.get_charge", new=AsyncMock()
+        )
+        mocker.patch(
+            "polar.subscription.tasks.payment_method_service.resolve_from_stripe_intent",
+            return_value=build_stripe_payment_method(details={"last4": "4242"}),
+        )
+        customer.billing_address = Address(country=CountryAlpha2("FR"))
+        await save_fixture(customer)
+        subscription = await create_subscription(
+            save_fixture,
+            product=product,
+            customer=customer,
+            status=SubscriptionStatus.trial_ended,
+            ends_at=utc_now() + timedelta(days=7),
+        )
+        price = product.prices[0]
+        assert is_fixed_price(price)
+        payment = await create_payment(
+            save_fixture,
+            product.organization,
+            amount=price.price_amount,
+            trigger=PaymentTrigger.trial_reactivation,
+        )
+        session.expunge_all()
+
+        await reactivate_ended_trial(subscription.id, payment.id)
+        await reactivate_ended_trial(subscription.id, payment.id)
+
+        updated_subscription = await session.get(Subscription, subscription.id)
+        assert updated_subscription is not None
+        assert updated_subscription.status == SubscriptionStatus.active
+        assert updated_subscription.payment_method_id is not None
+        updated_payment = await session.get(Payment, payment.id)
+        assert updated_payment is not None
+        assert updated_payment.order_id is not None
+        order = await OrderRepository.from_session(session).get_by_id(
+            updated_payment.order_id
+        )
+        assert order is not None
+        assert order.status == OrderStatus.paid
+        assert order.subscription_id == subscription.id

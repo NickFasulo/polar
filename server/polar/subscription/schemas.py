@@ -1,6 +1,6 @@
 import inspect
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from fastapi import Path
 from pydantic import (
@@ -38,6 +38,7 @@ from polar.kit.schemas import (
 )
 from polar.kit.versioning import Omissible, QuerySchema, Version, VersionedJsonSchema
 from polar.meter.schemas import Meter
+from polar.models import Order
 from polar.models.subscription import CustomerCancellationReason, SubscriptionStatus
 from polar.openapi import destructive_when_equals
 from polar.organization.schemas import OrganizationID
@@ -655,6 +656,44 @@ class SubscriptionChargePreview(Schema):
             "balance, floored at zero. This is the figure charged today."
         )
     )
+
+
+class SubscriptionReactivationPreview(Schema):
+    """Preview of the charge that reactivates a subscription."""
+
+    currency: str = Field(description="Currency of the charge.")
+    subtotal_amount: int = Field(
+        description="Subtotal amount in cents, before discount and tax."
+    )
+    discount_amount: int = Field(description="Discount amount in cents.")
+    net_amount: int = Field(description="Net amount in cents before taxes.")
+    tax_amount: int = Field(description="Tax amount in cents.")
+    total_amount: int = Field(
+        description="Total amount in cents (net + tax, before applying wallet balance)."
+    )
+    applied_balance_amount: int = Field(
+        description=(
+            "Wallet balance applied to this charge in cents: negative when the "
+            "customer's account credit reduces the amount due, positive when the "
+            "charge clears outstanding debt, zero otherwise."
+        )
+    )
+    due_amount: int = Field(
+        description="Amount charged to reactivate the subscription, in cents."
+    )
+
+    @classmethod
+    def from_order(cls, order: Order) -> Self:
+        return cls(
+            currency=order.currency,
+            subtotal_amount=order.subtotal_amount,
+            discount_amount=order.discount_amount,
+            net_amount=order.net_amount,
+            tax_amount=order.tax_amount,
+            total_amount=order.total_amount,
+            applied_balance_amount=order.applied_balance_amount,
+            due_amount=order.due_amount,
+        )
 
 
 class SubscriptionChangePreview(SubscriptionChargePreview):

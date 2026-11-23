@@ -240,3 +240,19 @@ class TestPackBatches:
         batches = list(pack_batches(entries))
 
         assert [entry for batch in batches for entry in batch] == entries
+
+
+@pytest.mark.anyio
+class TestDiscard:
+    async def test_drops_what_the_block_enqueued(self, redis: Redis) -> None:
+        CorrelationID.set()
+        jqm = JobQueueManager()
+        jqm.enqueue_job("dummy", "kept")
+        with jqm.discard():
+            jqm.enqueue_job("dummy", "dropped")
+            jqm.enqueue_events(uuid4())
+        await jqm.flush(dramatiq.get_broker(), redis)
+
+        message_ids = await redis.lrange("dramatiq:low_priority", 0, -1)
+        messages = await redis.hgetall("dramatiq:low_priority.msgs")
+        assert [json.loads(messages[id])["args"] for id in message_ids] == [["kept"]]

@@ -291,6 +291,17 @@ class PaymentActionRequired(OrderError):
         super().__init__(message, 402)
 
 
+class PaymentAmountMismatch(OrderError):
+    def __init__(self, order: Order, payment: Payment) -> None:
+        self.order = order
+        self.payment = payment
+        message = (
+            f"Payment {payment.id} of {payment.amount} doesn't match "
+            f"the due amount {order.due_amount} of order {order.id}."
+        )
+        super().__init__(message)
+
+
 class OffSessionChargesNotEnabled(OrderError):
     """The organization is not allowed to use the off-session charges API."""
 
@@ -1422,6 +1433,7 @@ class OrderService:
         reducer_cutoff: datetime | None = None,
         period_start: datetime | None = None,
         payment_mode: PaymentMode = PaymentMode.background,
+        payment: Payment | None = None,
     ) -> Order:
         """
         Create an order for a subscription based on its pending billing entries.
@@ -1439,6 +1451,8 @@ class OrderService:
                 In "sync" mode, the order will be created and payment
                 will be attempted immediately.
                 If payment fails, an exception will be raised and the order will not be created.
+            payment: A payment that already succeeded for this order. The order is
+                marked as paid by it instead of being charged.
 
         Returns:
             The created Order object.
@@ -1453,7 +1467,7 @@ class OrderService:
             cutoff=cutoff,
             reducer_cutoff=reducer_cutoff,
             period_start=period_start,
-            paid_on_creation=payment_mode == PaymentMode.sync,
+            paid_on_creation=payment_mode == PaymentMode.sync or payment is not None,
         ) as items:
             if len(items) == 0:
                 raise NoPendingBillingEntries(subscription)
@@ -1464,6 +1478,7 @@ class OrderService:
                 list(items),
                 billing_reason,
                 payment_mode=payment_mode,
+                payment=payment,
             )
 
     async def build_subscription_order(
@@ -1547,6 +1562,7 @@ class OrderService:
         *,
         payment_mode: PaymentMode = PaymentMode.background,
         product: Product | None = None,
+        payment: Payment | None = None,
     ) -> Order:
         """Build, persist and dispatch a subscription order from ``items``: invoice
         number, balance impact, optional meter reset, then payment."""
@@ -1591,8 +1607,14 @@ class OrderService:
         # transition.
         await self._on_order_created(session, order)
 
+        if payment is not None:
+            if payment.amount != order.due_amount:
+                raise PaymentAmountMismatch(order, payment)
+            payment_repository = PaymentRepository.from_session(session)
+            await payment_repository.update(payment, update_dict={"order": order})
+            order = await self.handle_payment(session, order, payment)
         # If the due amount is less or equal than zero, mark it as paid immediately
-        if order.due_amount <= 0:
+        elif order.due_amount <= 0:
             previous_status = order.status
             order = await repository.update(
                 order, update_dict={"status": OrderStatus.paid}

@@ -274,6 +274,21 @@ class JobQueueManager:
             del self._appended[appended:]
             raise
 
+    @contextlib.contextmanager
+    def discard(self) -> Iterator[None]:
+        """Forget what the block enqueued, whether it raises or not.
+
+        Pair it with a SAVEPOINT that is always rolled back, e.g. a dry run.
+        """
+        jobs, events = len(self._enqueued_jobs), len(self._ingested_events)
+        appended = len(self._appended)
+        try:
+            yield
+        finally:
+            del self._enqueued_jobs[jobs:]
+            del self._ingested_events[events:]
+            del self._appended[appended:]
+
     @classmethod
     def set(cls) -> "Self":
         job_queue_manager = cls()

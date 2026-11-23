@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from datetime import timedelta
 
 import pytest
@@ -709,6 +710,37 @@ class TestHandleSuccess:
         assert paid_order.status == OrderStatus.paid
         assert paid_order.next_payment_attempt_at is None
         assert paid_order.payment_lock_acquired_at is None
+
+    async def test_trial_reactivation(
+        self,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        product: Product,
+    ) -> None:
+        subscription_id = uuid.uuid4()
+        charge = build_stripe_charge(
+            metadata={
+                "organization_id": str(product.organization_id),
+                "subscription_id": str(subscription_id),
+                "payment_trigger": PaymentTrigger.trial_reactivation,
+            },
+            billing_details={"email": "customer@example.com"},
+            payment_method_details={"type": "card", "card": {"last4": "4242"}},
+        )
+        enqueue = mocker.patch("polar.integrations.stripe.payment.enqueue_job")
+
+        await handle_success(session, charge)
+
+        payment = await PaymentRepository.from_session(session).get_by_processor_id(
+            PaymentProcessor.stripe, charge.id
+        )
+        assert payment is not None
+        assert payment.trigger == PaymentTrigger.trial_reactivation
+        enqueue.assert_called_once_with(
+            "subscription.reactivate_ended_trial",
+            subscription_id=subscription_id,
+            payment_id=payment.id,
+        )
 
     async def test_wallet_order(
         self,

@@ -325,35 +325,44 @@ class CustomerService:
         )
         return await repository.get_one_or_none(statement)
 
+    async def get_or_create_stripe_customer_id(
+        self, session: AsyncSession, customer: CustomerModel
+    ) -> str:
+        if customer.stripe_customer_id is not None:
+            return customer.stripe_customer_id
+
+        params: CustomerCreateParams = {}
+        if customer.email is not None:
+            params["email"] = customer.email
+        if customer.name is not None:
+            params["name"] = customer.name
+        if customer.billing_address is not None:
+            params["address"] = customer.billing_address.to_dict()  # type: ignore
+        if customer.tax_id is not None:
+            try:
+                params["tax_id_data"] = [to_stripe_tax_id(customer.tax_id)]
+            except IncompatibleTaxIDFormat:
+                pass
+        stripe_customer = await stripe_service.create_customer(**params)
+        repository = CustomerRepository.from_session(session)
+        await repository.update(
+            customer, update_dict={"stripe_customer_id": stripe_customer.id}
+        )
+        return stripe_customer.id
+
     async def add_payment_method(
         self,
         session: AsyncSession,
         customer: CustomerModel,
         payment_method_create: CustomerPaymentMethodCreate,
     ) -> CustomerPaymentMethodCreateResponse:
-        if customer.stripe_customer_id is None:
-            params: CustomerCreateParams = {}
-            if customer.email is not None:
-                params["email"] = customer.email
-            if customer.name is not None:
-                params["name"] = customer.name
-            if customer.billing_address is not None:
-                params["address"] = customer.billing_address.to_dict()  # type: ignore
-            if customer.tax_id is not None:
-                try:
-                    params["tax_id_data"] = [to_stripe_tax_id(customer.tax_id)]
-                except IncompatibleTaxIDFormat:
-                    pass
-            stripe_customer = await stripe_service.create_customer(**params)
-            repository = CustomerRepository.from_session(session)
-            customer = await repository.update(
-                customer, update_dict={"stripe_customer_id": stripe_customer.id}
-            )
-            assert customer.stripe_customer_id is not None
+        stripe_customer_id = await self.get_or_create_stripe_customer_id(
+            session, customer
+        )
 
         setup_intent = await stripe_service.create_setup_intent(
             automatic_payment_methods={"enabled": True},
-            customer=customer.stripe_customer_id,
+            customer=stripe_customer_id,
             metadata={
                 "organization_id": str(customer.organization_id),
                 "customer_id": str(customer.id),

@@ -1,10 +1,21 @@
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx2 import AsyncClient
+from pytest_mock import MockerFixture
 
-from polar.enums import SubscriptionProrationBehavior, SubscriptionRecurringInterval
+from polar.enums import (
+    SubscriptionProrationBehavior,
+    SubscriptionRecurringInterval,
+    TaxBehavior,
+    TaxProcessor,
+)
+from polar.integrations.stripe.service import StripeService
+from polar.kit.address import Address, CountryAlpha2
 from polar.kit.currency import PresentmentCurrency
 from polar.kit.utils import utc_now
 from polar.kit.visibility import Visibility
@@ -14,6 +25,8 @@ from polar.models.product_price import ProductPriceSeatUnit
 from polar.models.subscription import SubscriptionStatus
 from polar.models.subscription_meter import SubscriptionMeter
 from polar.postgres import AsyncSession
+from polar.product.guard import is_fixed_price
+from polar.redis import Redis
 from polar.version import V2026_10, V2027_01
 from tests.fixtures.auth import (
     CUSTOMER_AUTH_SUBJECT,
@@ -259,6 +272,172 @@ class TestCustomerSubscriptionReactivate:
 
         assert response.status_code == 403
         assert response.json()["error"] == "PaymentNotReady"
+
+
+@pytest.fixture
+def stripe_service_mock(mocker: MockerFixture) -> MagicMock:
+    mock = MagicMock(spec=StripeService)
+    mocker.patch("polar.customer_portal.service.subscription.stripe_service", new=mock)
+    return mock
+
+
+@pytest.fixture
+def zero_tax_mock(mocker: MockerFixture) -> MagicMock:
+    mock = mocker.patch("polar.order.amounts.tax_calculation_service")
+
+    async def calculate(
+        reference: str, currency: str, *args: Any, **kwargs: Any
+    ) -> tuple[dict[str, Any], TaxProcessor]:
+        return (
+            {
+                "processor_id": "TAX_PROCESSOR_ID",
+                "amount": 0,
+                "currency": currency,
+                "tax_behavior": TaxBehavior.exclusive,
+                "tax_breakdown": [],
+            },
+            TaxProcessor.stripe,
+        )
+
+    mock.calculate = AsyncMock(side_effect=calculate)
+    return mock
+
+
+async def create_trial_ended_subscription(
+    save_fixture: SaveFixture, product: Product, customer: Customer
+) -> Subscription:
+    customer.billing_address = Address(country=CountryAlpha2("FR"))
+    customer.stripe_customer_id = "STRIPE_CUSTOMER_ID"
+    await save_fixture(customer)
+    return await create_subscription(
+        save_fixture,
+        product=product,
+        customer=customer,
+        status=SubscriptionStatus.trial_ended,
+        ends_at=utc_now() + timedelta(days=7),
+    )
+
+
+@pytest.mark.anyio
+class TestGetReactivationPreview:
+    @pytest.mark.auth(CUSTOMER_AUTH_SUBJECT)
+    async def test_not_trial_ended(
+        self,
+        client: AsyncClient,
+        save_fixture: SaveFixture,
+        product: Product,
+        customer: Customer,
+    ) -> None:
+        subscription = await create_active_subscription(
+            save_fixture, product=product, customer=customer
+        )
+
+        response = await client.get(
+            f"/v1/customer-portal/subscriptions/{subscription.id}/reactivation-preview"
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "NotReactivable"
+
+    @pytest.mark.auth(CUSTOMER_AUTH_SUBJECT)
+    async def test_valid(
+        self,
+        client: AsyncClient,
+        save_fixture: SaveFixture,
+        zero_tax_mock: MagicMock,
+        product: Product,
+        customer: Customer,
+    ) -> None:
+        subscription = await create_trial_ended_subscription(
+            save_fixture, product, customer
+        )
+        price = product.prices[0]
+        assert is_fixed_price(price)
+
+        response = await client.get(
+            f"/v1/customer-portal/subscriptions/{subscription.id}/reactivation-preview"
+        )
+
+        assert response.status_code == 200
+        json = response.json()
+        assert json["due_amount"] == price.price_amount
+        assert json["currency"] == price.price_currency
+
+
+@pytest.mark.anyio
+class TestReactivate:
+    @pytest.mark.auth(CUSTOMER_AUTH_SUBJECT)
+    async def test_requires_action(
+        self,
+        client: AsyncClient,
+        save_fixture: SaveFixture,
+        redis: Redis,
+        stripe_service_mock: MagicMock,
+        zero_tax_mock: MagicMock,
+        product: Product,
+        customer: Customer,
+    ) -> None:
+        subscription = await create_trial_ended_subscription(
+            save_fixture, product, customer
+        )
+        price = product.prices[0]
+        assert is_fixed_price(price)
+        stripe_service_mock.create_payment_intent.return_value = SimpleNamespace(
+            id="PAYMENT_INTENT_ID",
+            status="requires_action",
+            client_secret="CLIENT_SECRET",
+        )
+
+        response = await client.post(
+            f"/v1/customer-portal/subscriptions/{subscription.id}/reactivate",
+            json={"confirmation_token_id": "CONFIRMATION_TOKEN_ID"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "requires_action",
+            "client_secret": "CLIENT_SECRET",
+            "error": None,
+        }
+        params = stripe_service_mock.create_payment_intent.call_args.kwargs
+        assert params["amount"] == price.price_amount
+        assert params["confirmation_token"] == "CONFIRMATION_TOKEN_ID"
+        assert params["setup_future_usage"] == "off_session"
+        assert params["metadata"]["subscription_id"] == str(subscription.id)
+        assert params["metadata"]["payment_trigger"] == "trial_reactivation"
+        assert await redis.exists(
+            f"subscription:{subscription.id}:trial_reactivation_intent"
+        )
+
+    @pytest.mark.auth(CUSTOMER_AUTH_SUBJECT)
+    async def test_in_progress(
+        self,
+        client: AsyncClient,
+        save_fixture: SaveFixture,
+        redis: Redis,
+        stripe_service_mock: MagicMock,
+        product: Product,
+        customer: Customer,
+    ) -> None:
+        subscription = await create_trial_ended_subscription(
+            save_fixture, product, customer
+        )
+        await redis.set(
+            f"subscription:{subscription.id}:trial_reactivation_intent",
+            "PAYMENT_INTENT_ID",
+        )
+        stripe_service_mock.get_payment_intent.return_value = SimpleNamespace(
+            id="PAYMENT_INTENT_ID", status="processing"
+        )
+
+        response = await client.post(
+            f"/v1/customer-portal/subscriptions/{subscription.id}/reactivate",
+            json={"confirmation_token_id": "CONFIRMATION_TOKEN_ID"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "ReactivationInProgress"
+        stripe_service_mock.create_payment_intent.assert_not_called()
 
 
 @pytest.mark.anyio

@@ -1,14 +1,19 @@
 import uuid
 from collections.abc import Sequence
+from datetime import timedelta
 from enum import StrEnum
 from typing import Any
 
+import stripe as stripe_lib
 from sqlalchemy import Select, UnaryExpression, asc, desc, select
 from sqlalchemy.orm import contains_eager, joinedload, selectinload
 from sqlalchemy.sql.elements import OrderByList
 
 from polar.auth.models import AuthSubject, Customer, Member
+from polar.enums import PaymentProcessor
 from polar.exceptions import PolarError
+from polar.integrations.stripe.service import STRIPE_METADATA_PAYMENT_TRIGGER
+from polar.integrations.stripe.service import stripe as stripe_service
 from polar.kit.db.postgres import AsyncSession
 from polar.kit.pagination import PaginationParams, paginate
 from polar.kit.services import ResourceServiceReader
@@ -16,19 +21,32 @@ from polar.kit.sorting import Sorting
 from polar.kit.visibility import Visibility
 from polar.models import (
     Organization,
+    PaymentMethod,
     Product,
     Subscription,
     SubscriptionMeter,
 )
-from polar.models.subscription import CustomerCancellationReason
+from polar.models.payment import PaymentTrigger
+from polar.models.subscription import CustomerCancellationReason, SubscriptionStatus
+from polar.order.service import PaymentRetryValidationError
+from polar.payment_method.repository import PaymentMethodRepository
 from polar.payment_method.service import payment_method as payment_method_service
-from polar.subscription.schemas import SubscriptionChangePreview
+from polar.redis import Redis
+from polar.subscription.repository import SubscriptionRepository
+from polar.subscription.schemas import (
+    SubscriptionChangePreview,
+    SubscriptionReactivationPreview,
+)
 from polar.subscription.service import (
     AlreadyCanceledSubscription,
     SubscriptionUpdateContext,
 )
 from polar.subscription.service import subscription as subscription_service
 
+from ..schemas.order import (
+    CustomerOrderConfirmPayment,
+    CustomerOrderPaymentConfirmation,
+)
 from ..schemas.subscription import (
     CustomerSubscriptionChange,
     CustomerSubscriptionChangeSeats,
@@ -43,6 +61,9 @@ from ..schemas.subscription import (
     CustomerSubscriptionUpdateUnits,
 )
 from ..utils import get_customer_id
+from .customer import customer as customer_service
+
+TRIAL_REACTIVATION_LOCK_TTL = int(timedelta(days=1).total_seconds())
 
 
 class CustomerSubscriptionError(PolarError): ...
@@ -82,6 +103,21 @@ class PaymentMethodRequired(CustomerSubscriptionError):
         super().__init__(
             f"Add a payment method before {action} this subscription.",
             409,
+        )
+
+
+class NotReactivable(CustomerSubscriptionError):
+    def __init__(self) -> None:
+        super().__init__(
+            "This subscription can only be reactivated after its trial ended.",
+            409,
+        )
+
+
+class ReactivationInProgress(CustomerSubscriptionError):
+    def __init__(self) -> None:
+        super().__init__(
+            "A payment to reactivate this subscription is already in progress.", 409
         )
 
 
@@ -411,6 +447,161 @@ class CustomerSubscriptionService(ResourceServiceReader[Subscription]):
                 customer_reason=reason,
                 customer_comment=comment,
             )
+
+    async def get_reactivation_preview(
+        self, session: AsyncSession, subscription: Subscription
+    ) -> SubscriptionReactivationPreview:
+        if subscription.status != SubscriptionStatus.trial_ended:
+            raise NotReactivable()
+
+        subscription = await self._get_with_eager_options(session, subscription)
+        return await subscription_service.preview_trial_reactivation(
+            session, subscription
+        )
+
+    async def reactivate(
+        self,
+        session: AsyncSession,
+        redis: Redis,
+        subscription: Subscription,
+        confirmation: CustomerOrderConfirmPayment,
+    ) -> CustomerOrderPaymentConfirmation:
+        """Pay to reactivate a trial_ended subscription, with the customer present.
+
+        The payment comes first: the order is only created, and the subscription
+        activated, by the webhook once the payment succeeds.
+        """
+        if subscription.status != SubscriptionStatus.trial_ended:
+            raise NotReactivable()
+
+        return await self._start_trial_reactivation_payment(
+            session, redis, subscription, confirmation
+        )
+
+    async def _start_trial_reactivation_payment(
+        self,
+        session: AsyncSession,
+        redis: Redis,
+        subscription: Subscription,
+        confirmation: CustomerOrderConfirmPayment,
+    ) -> CustomerOrderPaymentConfirmation:
+        if confirmation.payment_processor != PaymentProcessor.stripe:
+            raise NotReactivable()
+
+        lock_key = f"subscription:{subscription.id}:trial_reactivation_intent"
+        previous_intent_id = await redis.get(lock_key)
+        if previous_intent_id is not None:
+            previous_intent = await stripe_service.get_payment_intent(
+                previous_intent_id
+            )
+            if previous_intent.status in {"processing", "succeeded"}:
+                raise ReactivationInProgress()
+            if previous_intent.status == "requires_action":
+                await stripe_service.cancel_payment_intent(previous_intent.id)
+
+        subscription = await self._get_with_eager_options(session, subscription)
+        customer = subscription.customer
+
+        saved_payment_method: PaymentMethod | None = None
+        if confirmation.payment_method_id is not None:
+            saved_payment_method = await PaymentMethodRepository.from_session(
+                session
+            ).get_by_id(confirmation.payment_method_id)
+            if (
+                saved_payment_method is None
+                or saved_payment_method.customer_id != customer.id
+            ):
+                raise PaymentRetryValidationError(
+                    "Payment method does not belong to customer"
+                )
+
+        stripe_customer_id = await customer_service.get_or_create_stripe_customer_id(
+            session, customer
+        )
+        subscription_id = subscription.id
+        metadata: dict[str, str] = {
+            "organization_id": str(subscription.organization_id),
+            "subscription_id": str(subscription_id),
+            STRIPE_METADATA_PAYMENT_TRIGGER: PaymentTrigger.trial_reactivation,
+        }
+        description = f"{subscription.organization.name} — {subscription.product.name}"
+
+        preview = await subscription_service.preview_trial_reactivation(
+            session, subscription
+        )
+
+        payment_method_params: dict[str, Any]
+        if saved_payment_method is not None:
+            payment_method_params = {
+                "payment_method": saved_payment_method.processor_id,
+                "automatic_payment_methods": {
+                    "enabled": True,
+                    "allow_redirects": "never",
+                },
+            }
+        else:
+            payment_method_params = {
+                "confirmation_token": confirmation.confirmation_token_id,
+                "setup_future_usage": "off_session",
+                "automatic_payment_methods": {
+                    "enabled": True,
+                    "allow_redirects": "never",
+                },
+            }
+
+        try:
+            payment_intent = await stripe_service.create_payment_intent(
+                amount=preview.due_amount,
+                currency=preview.currency,
+                customer=stripe_customer_id,
+                confirm=True,
+                description=description,
+                metadata=metadata,
+                **payment_method_params,
+            )
+        except stripe_lib.StripeError as e:
+            return CustomerOrderPaymentConfirmation(
+                status="failed",
+                client_secret=None,
+                error=(
+                    e.error.message
+                    if e.error and e.error.message
+                    else "Payment failed. Please try again."
+                ),
+            )
+
+        await redis.set(lock_key, payment_intent.id, ex=TRIAL_REACTIVATION_LOCK_TTL)
+
+        if payment_intent.status in {"succeeded", "processing"}:
+            return CustomerOrderPaymentConfirmation(
+                status=payment_intent.status, client_secret=None, error=None
+            )
+        if payment_intent.status == "requires_action":
+            return CustomerOrderPaymentConfirmation(
+                status="requires_action",
+                client_secret=payment_intent.client_secret,
+                error=None,
+            )
+        return CustomerOrderPaymentConfirmation(
+            status="failed",
+            client_secret=None,
+            error=(
+                payment_intent.last_payment_error.message
+                if payment_intent.last_payment_error
+                and payment_intent.last_payment_error.message
+                else "Payment failed"
+            ),
+        )
+
+    async def _get_with_eager_options(
+        self, session: AsyncSession, subscription: Subscription
+    ) -> Subscription:
+        repository = SubscriptionRepository.from_session(session)
+        loaded = await repository.get_by_id(
+            subscription.id, options=repository.get_eager_options()
+        )
+        assert loaded is not None
+        return loaded
 
     async def _require_payment_method(
         self, session: AsyncSession, subscription: Subscription, action: str

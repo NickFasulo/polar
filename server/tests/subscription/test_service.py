@@ -3,6 +3,7 @@ from collections import namedtuple
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
 import freezegun
@@ -29,6 +30,7 @@ from polar.enums import (
     SubscriptionProrationBehavior,
     SubscriptionRecurringInterval,
     TaxBehavior,
+    TaxProcessor,
 )
 from polar.event.repository import EventRepository
 from polar.event.system import SystemEvent
@@ -73,6 +75,7 @@ from polar.models.discount import DiscountDuration, DiscountType
 from polar.models.merchant_migration_record import MerchantMigrationCutoverStatus
 from polar.models.order import OrderBillingReasonInternal, OrderStatus
 from polar.models.organization import OrganizationStatus
+from polar.models.payment import PaymentTrigger
 from polar.models.product_price import ProductPriceAmountType, ProductPriceSeatUnit
 from polar.models.subscription import CustomerCancellationReason, SubscriptionStatus
 from polar.models.webhook_endpoint import WebhookEventType
@@ -82,7 +85,11 @@ from polar.notifications.notification import (
 )
 from polar.notifications.service import PartialNotification
 from polar.order.repository import OrderRepository
-from polar.order.service import PaymentFailed, PaymentFailedReason
+from polar.order.service import (
+    PaymentAmountMismatch,
+    PaymentFailed,
+    PaymentFailedReason,
+)
 from polar.order.service import order as order_service
 from polar.postgres import AsyncSession
 from polar.product.guard import (
@@ -96,7 +103,10 @@ from polar.product.price_set import PriceSet
 from polar.redis import Redis
 from polar.reducer.service import get_reducer_bucket_start
 from polar.reducer.service import reducer as reducer_service
-from polar.subscription.repository import SubscriptionUpdateRepository
+from polar.subscription.repository import (
+    SubscriptionRepository,
+    SubscriptionUpdateRepository,
+)
 from polar.subscription.schemas import (
     SubscriptionCreateCustomer,
     SubscriptionCreateExternalCustomer,
@@ -129,6 +139,7 @@ from polar.subscription.service import subscription as subscription_service
 from polar.subscription.update import generate_subscription_update
 from polar.trial_redemption.repository import TrialRedemptionRepository
 from polar.trial_redemption.service import trial_redemption as trial_redemption_service
+from polar.worker import JobQueueManager
 from tests.fixtures.auth import AuthSubjectFixture
 from tests.fixtures.database import SaveFixture
 from tests.fixtures.events import get_all_by_name
@@ -144,6 +155,7 @@ from tests.fixtures.random_objects import (
     create_event,
     create_meter,
     create_order,
+    create_payment,
     create_payment_method,
     create_product,
     create_product_fixed_and_seat,
@@ -4663,6 +4675,30 @@ class TestResume:
         assert cycle_entries[0].start_timestamp == frozen_time
 
 
+@pytest.fixture
+def zero_tax_mock(mocker: MockerFixture) -> MagicMock:
+    mock = mocker.patch("polar.order.amounts.tax_calculation_service")
+    mocker.patch("polar.order.service.tax_calculation_service", new=mock)
+
+    async def calculate(
+        reference: str, currency: str, *args: Any, **kwargs: Any
+    ) -> tuple[dict[str, Any], TaxProcessor]:
+        return (
+            {
+                "processor_id": "TAX_PROCESSOR_ID",
+                "amount": 0,
+                "currency": currency,
+                "tax_behavior": TaxBehavior.exclusive,
+                "tax_breakdown": [],
+            },
+            TaxProcessor.stripe,
+        )
+
+    mock.calculate = AsyncMock(side_effect=calculate)
+    mock.record = AsyncMock(return_value=("TAX_TRANSACTION_ID", TaxProcessor.stripe))
+    return mock
+
+
 @pytest.mark.anyio
 class TestReactivateEndedTrial:
     async def _create_trial_ended_subscription(
@@ -4764,6 +4800,7 @@ class TestReactivateEndedTrial:
             updated,
             OrderBillingReasonInternal.subscription_cycle_after_trial,
             cutoff=frozen_time,
+            payment=None,
         )
         assert_webhook_sent_once(
             webhook_service_send_mock,
@@ -4804,6 +4841,123 @@ class TestReactivateEndedTrial:
         await session.refresh(subscription)
         assert subscription.status == SubscriptionStatus.trial_ended
         assert subscription.ends_at is not None
+
+    async def test_valid_with_payment(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        zero_tax_mock: MagicMock,
+        product: Product,
+        customer: Customer,
+    ) -> None:
+        subscription = await self._create_trial_ended_subscription(
+            save_fixture, product, customer
+        )
+        price = product.prices[0]
+        assert is_fixed_price(price)
+        payment = await create_payment(
+            save_fixture,
+            product.organization,
+            amount=price.price_amount,
+            trigger=PaymentTrigger.trial_reactivation,
+        )
+
+        async with SubscriptionUpdateContext(
+            session, subscription, subscription_service
+        ) as ctx:
+            updated = await subscription_service.reactivate_ended_trial(
+                session, ctx, subscription, payment=payment
+            )
+
+        assert updated.status == SubscriptionStatus.active
+        order = payment.order
+        assert order is not None
+        assert order.status == OrderStatus.paid
+        assert order.subscription == updated
+        assert order.due_amount == price.price_amount
+
+    async def test_payment_amount_mismatch(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        zero_tax_mock: MagicMock,
+        product: Product,
+        customer: Customer,
+    ) -> None:
+        subscription = await self._create_trial_ended_subscription(
+            save_fixture, product, customer
+        )
+        price = product.prices[0]
+        assert is_fixed_price(price)
+        payment = await create_payment(
+            save_fixture, product.organization, amount=price.price_amount - 1
+        )
+
+        with pytest.raises(PaymentAmountMismatch):
+            async with SubscriptionUpdateContext(
+                session, subscription, subscription_service
+            ) as ctx:
+                await subscription_service.reactivate_ended_trial(
+                    session, ctx, subscription, payment=payment
+                )
+
+
+@pytest.mark.anyio
+class TestPreviewTrialReactivation:
+    async def test_not_trial_ended(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        product: Product,
+        customer: Customer,
+    ) -> None:
+        subscription = await create_active_subscription(
+            save_fixture, product=product, customer=customer
+        )
+
+        with pytest.raises(NotTrialEndedSubscription):
+            await subscription_service.preview_trial_reactivation(session, subscription)
+
+    async def test_valid(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        zero_tax_mock: MagicMock,
+        product: Product,
+        customer: Customer,
+    ) -> None:
+        customer.billing_address = Address(country=CountryAlpha2("FR"))
+        await save_fixture(customer)
+        subscription = await create_subscription(
+            save_fixture,
+            product=product,
+            customer=customer,
+            status=SubscriptionStatus.trial_ended,
+            ends_at=utc_now() + timedelta(days=7),
+        )
+        price = product.prices[0]
+        assert is_fixed_price(price)
+        price_amount, price_currency = price.price_amount, price.price_currency
+        subscription_id = subscription.id
+        job_queue_manager = JobQueueManager.get()
+        enqueued_jobs = list(job_queue_manager._enqueued_jobs)
+
+        preview = await subscription_service.preview_trial_reactivation(
+            session, subscription
+        )
+
+        assert preview.due_amount == price_amount
+        assert preview.currency == price_currency
+        assert job_queue_manager._enqueued_jobs == enqueued_jobs
+
+        repository = SubscriptionRepository.from_session(session)
+        reloaded = await repository.get_by_id(subscription_id)
+        assert reloaded is not None
+        assert reloaded.status == SubscriptionStatus.trial_ended
+        billing_entries = await BillingEntryRepository.from_session(
+            session
+        ).get_pending_by_subscription(subscription_id)
+        assert billing_entries == []
 
 
 @pytest.mark.anyio

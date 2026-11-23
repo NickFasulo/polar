@@ -14,6 +14,7 @@ from polar.models import Customer, Member, Subscription
 from polar.openapi import APITag
 from polar.order.service import PaymentFailed
 from polar.postgres import get_db_session
+from polar.redis import Redis, get_redis
 from polar.routing import APIRouter
 from polar.subscription.schemas import (
     SubscriptionCancelPreview,
@@ -21,6 +22,7 @@ from polar.subscription.schemas import (
     SubscriptionChargePreview,
     SubscriptionID,
     SubscriptionMeterChargePreview,
+    SubscriptionReactivationPreview,
 )
 from polar.subscription.service import (
     AlreadyCanceledSubscription,
@@ -32,6 +34,10 @@ from polar.subscription.service import subscription as subscription_service
 from polar.version import V2027_01
 
 from .. import auth
+from ..schemas.order import (
+    CustomerOrderConfirmPayment,
+    CustomerOrderPaymentConfirmation,
+)
 from ..schemas.subscription import (
     CustomerPortalSubscriptionListParams,
     CustomerSubscription,
@@ -43,8 +49,10 @@ from ..schemas.subscription import (
 )
 from ..service.subscription import (
     CustomerSubscriptionSortProperty,
+    NotReactivable,
     PauseResumeNotAllowed,
     PaymentMethodRequired,
+    ReactivationInProgress,
     RevokeNotAllowed,
     UpdateSubscriptionPlanNotAllowed,
     UpdateSubscriptionSeatsNotAllowed,
@@ -155,6 +163,77 @@ async def get_charge_preview(
         raise ResourceNotFound()
 
     return await subscription_service.calculate_charge_preview(session, subscription)
+
+
+@router.get(
+    "/{id}/reactivation-preview",
+    summary="Preview Reactivation Charge",
+    response_model=SubscriptionReactivationPreview,
+    responses={
+        404: SubscriptionNotFound,
+        409: {
+            "description": (
+                "Subscription can't be reactivated, or the customer is missing "
+                "a complete billing address."
+            ),
+            "model": NotReactivable.schema() | MissingBillingDetails.schema(),
+        },
+    },
+    tags=[APITag.private],
+)
+async def get_reactivation_preview(
+    id: SubscriptionID,
+    auth_subject: auth.CustomerPortalUnionBillingRead,
+    session: AsyncSession = Depends(get_db_session),
+) -> SubscriptionReactivationPreview:
+    """Get the charge that reactivates a trial_ended subscription."""
+    subscription = await customer_subscription_service.get_by_id(
+        session, auth_subject, id
+    )
+    if subscription is None:
+        raise ResourceNotFound()
+
+    return await customer_subscription_service.get_reactivation_preview(
+        session, subscription
+    )
+
+
+@router.post(
+    "/{id}/reactivate",
+    summary="Reactivate Subscription",
+    response_model=CustomerOrderPaymentConfirmation,
+    responses={
+        404: SubscriptionNotFound,
+        409: {
+            "description": (
+                "Subscription can't be reactivated, the customer is missing a "
+                "complete billing address, or a reactivation payment is already "
+                "in progress."
+            ),
+            "model": NotReactivable.schema()
+            | MissingBillingDetails.schema()
+            | ReactivationInProgress.schema(),
+        },
+    },
+    tags=[APITag.private],
+)
+async def reactivate(
+    id: SubscriptionID,
+    confirmation: CustomerOrderConfirmPayment,
+    auth_subject: auth.CustomerPortalUnionBillingWrite,
+    session: AsyncSession = Depends(get_db_session),
+    redis: Redis = Depends(get_redis),
+) -> CustomerOrderPaymentConfirmation:
+    """Pay to reactivate a trial_ended subscription."""
+    subscription = await customer_subscription_service.get_by_id(
+        session, auth_subject, id, for_update=True
+    )
+    if subscription is None:
+        raise ResourceNotFound()
+
+    return await customer_subscription_service.reactivate(
+        session, redis, subscription, confirmation
+    )
 
 
 @router.get(

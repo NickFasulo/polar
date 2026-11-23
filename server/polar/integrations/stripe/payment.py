@@ -267,6 +267,18 @@ async def handle_success(
             payment_id=payment.id if payment is not None else None,
         )
 
+    if (
+        payment is not None
+        and trigger == PaymentTrigger.trial_reactivation
+        and object.metadata is not None
+        and (subscription_id := object.metadata.get("subscription_id")) is not None
+    ):
+        enqueue_job(
+            "subscription.reactivate_ended_trial",
+            subscription_id=uuid.UUID(subscription_id),
+            payment_id=payment.id,
+        )
+
 
 async def handle_failure(
     session: AsyncSession,
