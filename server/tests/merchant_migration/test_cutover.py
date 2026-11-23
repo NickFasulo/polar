@@ -209,7 +209,11 @@ def _discounted_renewals(subscription: Subscription, renewals: int) -> list[bool
     discounted: list[bool] = []
     period_start = subscription.current_period_end
     for _ in range(renewals):
-        discounted.append(not discount.is_repetition_expired(applied_at, period_start))
+        discounted.append(
+            not discount.is_repetition_expired(
+                applied_at, period_start, subscription.anchor_day
+            )
+        )
         period_start = subscription.recurring_interval.get_next_period(
             period_start,
             subscription.anchor_day,

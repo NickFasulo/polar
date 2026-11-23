@@ -1531,7 +1531,9 @@ class SubscriptionService:
         discount = subscription.discount
         renews_at = subscription.current_period_end
         if discount is not None and discount.is_repetition_expired(
-            subscription.discount_applied_at or renews_at, renews_at
+            subscription.discount_applied_at or renews_at,
+            renews_at,
+            subscription.anchor_day,
         ):
             discount = None
         amount = (
@@ -1566,6 +1568,7 @@ class SubscriptionService:
         if subscription.discount.is_repetition_expired(
             subscription.discount_applied_at,
             check_period_start,
+            subscription.anchor_day,
         ):
             subscription.discount = None
 
@@ -3587,6 +3590,7 @@ class SubscriptionService:
             if not subscription.discount.is_repetition_expired(
                 discount_applied_at,
                 next_period_start,
+                subscription.anchor_day,
             ):
                 applicable_discount = subscription.discount
 
@@ -3632,6 +3636,7 @@ class SubscriptionService:
         if discount is not None and discount.is_repetition_expired(
             subscription.discount_applied_at or subscription.current_period_start,
             meter_period_end,
+            subscription.anchor_day,
         ):
             discount = None
 

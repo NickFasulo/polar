@@ -7,7 +7,6 @@ from uuid import UUID
 from alembic_utils.pg_function import PGFunction
 from alembic_utils.pg_trigger import PGTrigger
 from alembic_utils.replaceable_entity import register_entities
-from dateutil.relativedelta import relativedelta
 from sqlalchemy import (
     TIMESTAMP,
     ForeignKey,
@@ -27,6 +26,7 @@ from sqlalchemy.orm import (
     relationship,
 )
 
+from polar.enums import RecurringInterval
 from polar.kit.db.models import RecordModel
 from polar.kit.external_id import ExternalIDMixin
 from polar.kit.math import polar_round
@@ -128,6 +128,7 @@ class Discount(MetadataMixin, ExternalIDMixin, RecordModel):
         self,
         discount_applied_at: datetime,
         current_period_start: datetime,
+        anchor_day: int,
     ) -> bool:
         """
         Check if a discount's repetition has expired for the current cycle.
@@ -142,6 +143,10 @@ class Discount(MetadataMixin, ExternalIDMixin, RecordModel):
             current_period_start: The start date of the period being checked
                 (billing period for billing cycles, meter boundary for meter
                 cycles).
+            anchor_day: The subscription's billing anchor day. Billing periods
+                re-expand to it after short months, so the end of the discount
+                window must follow the same anchored schedule or the last
+                covered cycle trips the raw month-add boundary early.
 
         Returns:
             True if the discount should no longer apply to this cycle.
@@ -156,8 +161,13 @@ class Discount(MetadataMixin, ExternalIDMixin, RecordModel):
             return False
 
         # For repeating discounts, calculate expiration from when discount was first applied
-        # -1 because the first month counts as a first repetition
-        end_at = discount_applied_at + relativedelta(months=self.duration_in_months - 1)
+        # -1 because the first month counts as a first repetition.
+        # The end boundary uses the same clamp-and-re-expand schedule billing
+        # periods follow: a raw relativedelta undershoots when anchor_day is
+        # larger than the clamped day discount_applied_at landed on.
+        end_at = RecurringInterval.month.get_next_period(
+            discount_applied_at, anchor_day, self.duration_in_months - 1
+        )
         return current_period_start > end_at
 
     __table_args__ = (

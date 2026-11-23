@@ -225,10 +225,10 @@ def _imported_discount_at(
     applied_at = last_discounted - relativedelta(months=months - 1)
     # Going back to a shorter month clamps the day, so counting the months forward
     # again can end before the renewal it has to keep.
-    while discount.is_repetition_expired(applied_at, last_discounted):
+    while discount.is_repetition_expired(applied_at, last_discounted, anchor):
         applied_at += timedelta(days=1)
     # Renewals a day apart can fall in a gap no month count lands in.
-    if not discount.is_repetition_expired(applied_at, renewal):
+    if not discount.is_repetition_expired(applied_at, renewal, anchor):
         return ImportedDiscount(skip=_DISCOUNT_END_UNREPRESENTABLE)
     return ImportedDiscount(discount=discount, applied_at=applied_at)
 

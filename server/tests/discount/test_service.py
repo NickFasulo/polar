@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Literal
 from unittest.mock import AsyncMock
 
@@ -947,9 +947,9 @@ class TestIsRepetitionExpired:
         next_month = now + timedelta(days=30)
         # 'once' discount should apply when discount_applied_at equals current_period_start
         # (this is the first cycle where the discount is used)
-        assert discount.is_repetition_expired(now, now) is False
+        assert discount.is_repetition_expired(now, now, now.day) is False
         # 'once' discount should expire for subsequent cycles
-        assert discount.is_repetition_expired(now, next_month) is True
+        assert discount.is_repetition_expired(now, next_month, now.day) is True
 
     async def test_forever_never_expires(
         self,
@@ -968,7 +968,7 @@ class TestIsRepetitionExpired:
         now = utc_now()
         future = now + timedelta(days=365)
         # Forever discounts never expire, regardless of when applied or current period
-        assert discount.is_repetition_expired(now, future) is False
+        assert discount.is_repetition_expired(now, future, now.day) is False
 
     async def test_repeating_expires_after_duration(
         self,
@@ -990,9 +990,44 @@ class TestIsRepetitionExpired:
         after_duration = now + timedelta(days=120)  # ~4 months
 
         # Should not expire within duration (from when discount was first applied)
-        assert discount.is_repetition_expired(now, within_duration) is False
+        assert discount.is_repetition_expired(now, within_duration, now.day) is False
         # Should expire after duration
-        assert discount.is_repetition_expired(now, after_duration) is True
+        assert discount.is_repetition_expired(now, after_duration, now.day) is True
+
+    async def test_repeating_anchored_on_clamped_month_day(
+        self,
+        save_fixture: SaveFixture,
+        organization: Organization,
+    ) -> None:
+        """Repeating discounts anchored on the 29th-31st still cover all of
+        their cycles when a short month clamps the applied day."""
+        discount = await create_discount(
+            save_fixture,
+            type=DiscountType.percentage,
+            basis_points=5_000,
+            duration=DiscountDuration.repeating,
+            duration_in_months=3,
+            organization=organization,
+        )
+
+        # anchor_day=31: billing periods run Feb 28 -> Mar 31 -> Apr 30 -> May 31
+        applied_at = datetime(2025, 2, 28)
+        assert (
+            discount.is_repetition_expired(applied_at, datetime(2025, 2, 28), 31)
+            is False
+        )
+        assert (
+            discount.is_repetition_expired(applied_at, datetime(2025, 3, 31), 31)
+            is False
+        )
+        assert (
+            discount.is_repetition_expired(applied_at, datetime(2025, 4, 30), 31)
+            is False
+        )
+        assert (
+            discount.is_repetition_expired(applied_at, datetime(2025, 5, 31), 31)
+            is True
+        )
 
 
 @pytest.mark.anyio
