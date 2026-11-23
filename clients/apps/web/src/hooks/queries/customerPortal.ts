@@ -633,38 +633,46 @@ export const useCustomerResumeSubscription = (api: Client) =>
     },
   })
 
-export const useCustomerReactivateSubscription = (api: Client) =>
-  useMutation({
-    mutationFn: async (variables: { id: string }) => {
-      const result = await api.PATCH('/v1/customer-portal/subscriptions/{id}', {
-        params: { path: { id: variables.id } },
-        body: {
-          reactivate: true,
-        },
-      })
-      if (result.error) {
-        throw new Error(
-          extractApiErrorMessage(
-            result.error,
-            'Failed to reactivate subscription',
-          ),
-        )
-      }
-      return result
-    },
-    onSuccess: () => {
-      const queryClient = getQueryClient()
-      queryClient.invalidateQueries({
-        queryKey: ['customer_subscriptions'],
-      })
-      queryClient.invalidateQueries({
-        queryKey: ['customer_orders'],
-      })
-      queryClient.invalidateQueries({
-        queryKey: ['customer_benefit_grants'],
-      })
-    },
+export const useCustomerSubscriptionReactivationPreview = (
+  api: Client,
+  id: string,
+  enabled = true,
+) =>
+  useQuery({
+    queryKey: ['customer_subscription_reactivation_preview', { id }],
+    queryFn: () =>
+      unwrap(
+        api.GET('/v1/customer-portal/subscriptions/{id}/reactivation-preview', {
+          params: { path: { id } },
+        }),
+      ),
+    retry: false,
+    enabled,
   })
+
+export const useCustomerSubscriptionReactivate = (api: Client) =>
+  useMutation({
+    mutationFn: async (variables: {
+      id: string
+      body: schemas['CustomerOrderConfirmPayment']
+    }) =>
+      api.POST('/v1/customer-portal/subscriptions/{id}/reactivate', {
+        params: { path: { id: variables.id } },
+        body: variables.body,
+      }),
+  })
+
+export const invalidateReactivatedSubscription = () => {
+  const queryClient = getQueryClient()
+  for (const queryKey of [
+    ['customer_subscriptions'],
+    ['customer_orders'],
+    ['customer_benefit_grants'],
+    ['customer_subscription_reactivation_preview'],
+  ]) {
+    queryClient.invalidateQueries({ queryKey })
+  }
+}
 
 export const useCustomerCustomerMeters = (
   api: Client,
